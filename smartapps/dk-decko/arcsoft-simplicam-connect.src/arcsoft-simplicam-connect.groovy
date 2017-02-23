@@ -27,7 +27,7 @@ definition(
 preferences {
 	section("Closeli Credentials") {
 		input(name: "email", type: "email", title: "Email address", description: "Enter Email Address", required: true)
-        input(name: "password", type: "password", title: "Password", description: "Enter password", required: true)
+        input(name: "password", type: "password", title: "Password", description: "Enter Password", required: true)
 	}
 }
 
@@ -44,14 +44,17 @@ def updated() {
 
 def initialize() {
 	// TODO: subscribe to attributes, devices, locations, etc.
-    if (closeliGetSession(settings.email, settings.password)) {
+    if (closeliGetSession()) {
     	closeliGetDevices()
     }
+    
+    runEvery5Minutes(syncState)
 }
 
-def closeliGetSession(email, password) {
+def closeliGetSession() {
 	try {
-    	httpPost("https://client.closeli.com/login", "email=${email}&password=${password}") { resp ->
+    	httpPost("https://client.closeli.com/login", "email=${settings.email}&password=${settings.password}") { resp ->
+        	log.debug("Got a response for get session")
 			if (resp.contentType == "application/json") {
             	if (resp.data["success"] == true) {
                 	state.cookie = ""
@@ -69,22 +72,100 @@ def closeliGetSession(email, password) {
             }
         }
     } catch (e) {
-    	log.debug("Didn't work: $e")
+    	log.debug("Exception raised during login: $e")
     }
 }
 
-def closeliGetDevices(session) {
-	httpGet(["uri": "https://client.closeli.com/device/list", "headers": ["Cookie": state.cookie]]) { resp ->
-    	resp.data.list.devicelist.each {
-        	log.debug(it)
-            def dni = [app.id, it.deviceid].join(".")
-            if (! getChildDevice(dni)) {
-	            addChildDevice(app.namespace, "Arcsoft Simplicam", dni, null, ["deviceid": it.deviceid, "devicename": it.devicename])
-            } else {
-            	log.debug("Device with id ${dni} already exists")
+def closeliGetCSRF() {
+	try {
+        httpGet(["uri": "https://client.closeli.com", "headers": ["Cookie": state.cookie]]) { resp ->
+        	log.debug("Got a response for get csrf")
+            def csrf = ""
+            resp.data[0].children[0].children.each { node ->
+                if (node.attributes()["name"] == "_csrf") {
+                    csrf = node.attributes()["content"]
+                }
             }
+
+            if (csrf != "") {
+                return csrf
+            } else {
+    			log.debug("Could not find CSRF in response")
+            }
+        }
+    } catch (e) {
+    	log.debug("Exception raised while trying to get CSRF token: $e")
+    }
+}
+
+def closeliGetDevices() {
+	closeliGetSession()
+	try {
+        httpGet(["uri": "https://client.closeli.com/device/list", "headers": ["Cookie": state.cookie]]) { resp ->
+        	log.debug("Got a response for get devices: ${resp.data}")
+            return resp.data.list.devicelist
+        }
+    } catch (e) {
+    	log.debug("Exception raised while getting devices: $e")
+    }
+}
+
+def addDevices() {
+	def deviceData = closeliGetDevices()
+    
+    deviceData.each {
+        log.debug(it)
+        def dni = [app.id, it.deviceid].join(".")
+
+        if (! getChildDevice(dni)) {
+            def d = addChildDevice(app.namespace, "Arcsoft Simplicam", dni, null, ["label": it.devicename])
+            d.setDeviceId(it.deviceid)
+        } else {
+            log.debug("Device with id ${dni} already exists")
         }
     }
 }
+
+def closeliSaveSetting(did, path, element) {
+	closeliGetSession()
+	def csrf = closeliGetCSRF()
+    if (csrf != "") {
+    	try {
+            httpPost(["uri": "https://client.closeli.com/device/saveSetting", "headers": ["Cookie": state.cookie, "x-requested-with": "XMLHttpRequest"], "body": "deviceId=${did}&path=${path}&element=${element}&_csrf_header=${csrf}"]) { resp ->
+            	log.debug("Got a response for save setting: ${resp.data}")
+                if (resp.data.success != true) {
+                	log.debug("Failed to save setting")
+                }
+            }
+        } catch (e) {
+        	log.debug("Exception raised while trying to save setting: $e")
+        }
+    }
+}
+
+def closeliCameraEnabled(did, enabled) {
+	log.debug("Set status of ${did} to ${enabled}")
+    def element = enabled ? "<status>On</status>" : "<status>OffByManual</status>"
+    closeliSaveSetting(did, "profile/general/status", element)
+}
+
+def syncState() {
+	def deviceData = closeliGetDevices()
+    deviceData.each {
+    	def dni = [app.id, it.deviceid].join(".")
+        def device = getChildDevice(dni)
+        
+        if (device) {
+        	def cloudStatus = (it.deviceStatus == "On" ? "on" : "off")
+            def devStatus = device.currentSwitch
+        	if (devStatus != cloudStatus) {
+            	log.debug("Camera is not in sync with cloud. Cloud is ${cloudStatus}, device is ${devStatus}")
+                device.sendEvent(name: "switch", value: cloudStatus, isStateChange: true)
+            }
+        	//sendEvent(device, [])
+        }
+    }
+}
+
 
 // TODO: implement event handlers
